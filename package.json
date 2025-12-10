@@ -1,7 +1,7 @@
 {
   "name": "verification-bot",
   "version": "1.0.0",
-  "description": "A Discord verification bot with captcha, role management, and server owner-only administration.",
+  "description": "Discord verification bot with image captcha, role management and owner-only commands",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -10,9 +10,8 @@
   "author": "damonekl",
   "license": "MIT",
   "dependencies": {
-    "discord.js": "^14.25.1",
-    "dotenv": "^16.6.1",
     "canvas": "^2.11.2",
-    "express": "^4.19.2"
+    "discord.js": "^14.25.1",
+    "dotenv": "^16.6.1"
   }
 }
