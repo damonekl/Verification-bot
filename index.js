@@ -1,90 +1,151 @@
-require("dotenv").config();
+require("dotenv").config({ path: "./INFO.env" });
 const fs = require("fs");
 const path = require("path");
 const {
-    Client,
-    Partials,
-    GatewayIntentBits,
-    AttachmentBuilder,
-    EmbedBuilder
+  Client,
+  GatewayIntentBits,
+  Partials,
+  AttachmentBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
 } = require("discord.js");
-
-const { generateCaptcha } = require("./utils/captcha");
-
+const { createCaptcha } = require("./utils/captcha");
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
-    partials: [Partials.Channel]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages],
+  partials: [Partials.Channel]
 });
-
-// 🗂 Dynamické načtení příkazů
+if (!fs.existsSync(path.join(__dirname, "data"))) fs.mkdirSync(path.join(__dirname, "data"));
+const captchaMap = new Map();
 client.commands = new Map();
-client.logChannels = new Map();
-
 const commandsPath = path.join(__dirname, "commands");
-const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith(".js"));
-
-for (const file of commandFiles) {
-    const command = require(`./commands/${file}`);
-    client.commands.set(command.data.name, command);
+fs.readdirSync(commandsPath).filter(f => f.endsWith(".js")).forEach(file => {
+  const cmd = require(path.join(commandsPath, file));
+  client.commands.set(cmd.data.name, cmd);
+});
+function getConfig(guildId) {
+  const file = path.join(__dirname, "data", `${guildId}.json`);
+  if (!fs.existsSync(file)) {
+    const init = { verifiedRole: null, unverifiedRole: null, verifyChannel: null, logChannel: null };
+    fs.writeFileSync(file, JSON.stringify(init, null, 2));
+    return { path: file, data: init };
+  }
+  return { path: file, data: JSON.parse(fs.readFileSync(file)) };
 }
-
-// Ready event
-client.on("clientReady", () => {
-    console.log(`🟢 Bot běží jako ${client.user.tag}`);
-});
-
-// Slash command handler
-client.on("interactionCreate", async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-
-    const cmd = client.commands.get(interaction.commandName);
-    if (!cmd) return;
-
+async function ensureRoles(guild) {
+  const cfgObj = getConfig(guild.id);
+  let changed = false;
+  if (!cfgObj.data.verifiedRole || !guild.roles.cache.has(cfgObj.data.verifiedRole)) {
+    const r = await guild.roles.create({ name: "Verified", color: "Green", reason: "Auto-create Verified role" });
+    cfgObj.data.verifiedRole = r.id;
+    changed = true;
+  }
+  if (!cfgObj.data.unverifiedRole || !guild.roles.cache.has(cfgObj.data.unverifiedRole)) {
+    const r = await guild.roles.create({ name: "Unverified", color: "Red", reason: "Auto-create Unverified role" });
+    cfgObj.data.unverifiedRole = r.id;
+    changed = true;
+  }
+  if (changed) fs.writeFileSync(cfgObj.path, JSON.stringify(cfgObj.data, null, 2));
+  return cfgObj.data;
+}
+async function lockChannelsForGuild(guild, verifiedRoleId) {
+  guild.channels.cache.forEach(ch => {
+    if (!ch || !ch.isTextBased() || ch.type !== 0) return;
     try {
-        await cmd.execute(interaction);
-    } catch (err) {
-        console.log(err);
-        interaction.reply({ content: "⚠️ Nastala chyba při vykonání příkazu.", ephemeral: true });
-    }
+      ch.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false });
+      ch.permissionOverwrites.edit(verifiedRoleId, { SendMessages: true });
+    } catch (e) {}
+  });
+}
+client.once("ready", async () => {
+  for (const [guildId, guild] of client.guilds.cache) {
+    try {
+      await ensureRoles(guild);
+    } catch (e) {}
+  }
 });
-
-// ---------------- CAPTCHA BUTTON ---------------- //
+client.on("guildCreate", async guild => {
+  try {
+    await ensureRoles(guild);
+  } catch (e) {}
+});
+client.on("guildMemberAdd", async member => {
+  const cfg = getConfig(member.guild.id).data;
+  if (cfg.unverifiedRole) {
+    try {
+      await member.roles.add(cfg.unverifiedRole);
+    } catch (e) {}
+  }
+  if (cfg.logChannel) {
+    const ch = member.guild.channels.cache.get(cfg.logChannel);
+    ch?.send(`👤 New member ${member.user.tag} assigned Unverified`);
+  }
+});
 client.on("interactionCreate", async interaction => {
-    if (!interaction.isButton()) return;
-    if (interaction.customId !== "verify_start") return;
-
-    const { text, buffer } = await generateCaptcha();
-    const attachment = new AttachmentBuilder(buffer, { name: "captcha.png" });
-
-    const embed = new EmbedBuilder()
-        .setTitle("🧩 CAPTCHA Ověření")
-        .setDescription("Opiš text z obrázku:")
-        .setColor("Blue")
-        .setImage("attachment://captcha.png");
-
-    await interaction.reply({
-        embeds: [embed],
-        files: [attachment],
-        ephemeral: true
-    });
-
-    const filter = m => m.author.id === interaction.user.id;
-    const collector = interaction.channel.createMessageCollector({ filter, time: 15000, max: 1 });
-
-    collector.on("collect", async m => {
-        if (m.content.toUpperCase() === text) {
-            const role = interaction.guild.roles.cache.find(r => r.name === "Verified");
-
-            await m.reply("✅ Ověření úspěšné!");
-            await interaction.member.roles.add(role);
-
-            const logChannelId = client.logChannels.get(interaction.guild.id);
-            const logChan = interaction.guild.channels.cache.get(logChannelId);
-            logChan?.send(`✔ **${interaction.user.tag}** prošel ověřením.`);
-        } else {
-            await m.reply("❌ Špatně.");
+  try {
+    if (interaction.isChatInputCommand()) {
+      const cmd = client.commands.get(interaction.commandName);
+      if (!cmd) return;
+      return cmd.execute(interaction, client, getConfig);
+    }
+    if (interaction.isButton() && interaction.customId === "verify_start") {
+      const { code, buffer } = await createCaptcha();
+      const attachment = new AttachmentBuilder(buffer, { name: "captcha.png" });
+      captchaMap.set(`${interaction.guild.id}:${interaction.user.id}`, code);
+      const embed = new EmbedBuilder().setTitle("🧩 CAPTCHA").setDescription("Press Answer and enter the code shown in the image.").setImage("attachment://captcha.png");
+      const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("captcha_answer").setLabel("Answer").setStyle(ButtonStyle.Primary));
+      await interaction.reply({ embeds: [embed], files: [attachment], components: [row], ephemeral: true });
+      return;
+    }
+    if (interaction.isButton() && interaction.customId === "captcha_answer") {
+      const modal = new ModalBuilder().setCustomId("captcha_modal").setTitle("Enter CAPTCHA");
+      const input = new TextInputBuilder().setCustomId("captcha_input").setLabel("CAPTCHA code").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10);
+      const firstRow = new ActionRowBuilder().addComponents(input);
+      modal.addComponents(firstRow);
+      await interaction.showModal(modal);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId === "captcha_modal") {
+      const answer = interaction.fields.getTextInputValue("captcha_input").trim().toUpperCase();
+      const key = `${interaction.guild.id}:${interaction.user.id}`;
+      const expected = captchaMap.get(key);
+      if (!expected) {
+        await interaction.reply({ content: "No active CAPTCHA. Click the verify button first.", ephemeral: true });
+        return;
+      }
+      if (answer === expected) {
+        const cfgObj = getConfig(interaction.guild.id);
+        const cfg = cfgObj.data;
+        await ensureRoles(interaction.guild);
+        try {
+          const member = await interaction.guild.members.fetch(interaction.user.id);
+          if (cfg.unverifiedRole && member.roles.cache.has(cfg.unverifiedRole)) {
+            await member.roles.remove(cfg.unverifiedRole);
+          }
+          if (cfg.verifiedRole) {
+            await member.roles.add(cfg.verifiedRole);
+          }
+          if (cfg.logChannel) {
+            const ch = interaction.guild.channels.cache.get(cfg.logChannel);
+            ch?.send(`✅ **${interaction.user.tag}** verified.`);
+          }
+          captchaMap.delete(key);
+          await interaction.reply({ content: "✅ Verification successful — you have been given the Verified role!", ephemeral: true });
+        } catch (e) {
+          await interaction.reply({ content: `❌ Error assigning role: ${e.message}`, ephemeral: true });
         }
-    });
+      } else {
+        await interaction.reply({ content: "❌ Wrong code. Please try again by clicking Verify.", ephemeral: true });
+      }
+    }
+  } catch (err) {
+    if (!interaction.replied && !interaction.deferred) {
+      try { await interaction.reply({ content: "⚠️ An error occurred.", ephemeral: true }); } catch {}
+    }
+  }
 });
-
 client.login(process.env.TOKEN);
